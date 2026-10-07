@@ -1,6 +1,6 @@
 <div align="center">
 
-# localcode
+# OpenCode - Quick Start
 
 **OpenCode + llama.cpp on your own NVIDIA GPU, set up in one command.**
 
