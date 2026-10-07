@@ -1,0 +1,13 @@
+# localcode-default: qwen3.5-35b-a3b
+#
+# llama-server router presets. Each [section] name is the model ID.
+# Edit `model` to point at your downloaded .gguf file.
+
+[*]
+n-gpu-layers = 99
+flash-attn = on
+
+[qwen3.5-35b-a3b]
+model = /home/YOU/models/Qwen3.5-35B-A3B-Q4_K_M.gguf
+ctx-size = 65536
+n-cpu-moe = 20

@@ -1,0 +1,16 @@
+{
+  // Minimal OpenCode config pointing at the local llama-server router.
+  // Check the OpenCode docs if your version expects a different provider format.
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (local)",
+      "options": { "baseURL": "http://127.0.0.1:8081/v1" },
+      "models": {
+        "qwen3.5-35b-a3b": { "name": "Qwen3.5 35B A3B" }
+      }
+    }
+  },
+  "model": "local/qwen3.5-35b-a3b"
+}

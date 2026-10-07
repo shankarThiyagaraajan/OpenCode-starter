@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+# localcode - start the llama.cpp router, load the default model, launch OpenCode.
+#
+# Before loading, it checks the GPU with nvidia-smi, lists what is using VRAM
+# (grouped by application, largest first, with a few words about each one) and
+# lets you pick applications to close. If the load still runs out of memory it
+# shows the same picker and retries.
+#
+# Usage:   localcode [--lc-model NAME] [--lc-pick] [opencode args...]
+#   --lc-model NAME   load this model instead of the default
+#   --lc-pick         always offer the close-apps picker before loading
+# Env:     LOCALCODE_MODEL          model name (overridden by --lc-model)
+#          LOCALCODE_INI            models.ini path
+#          LOCALCODE_MIN_FREE_MIB   free VRAM needed to skip the prompt (default 12000;
+#                                   set it to roughly what your model needs on the GPU)
+#          LOCALCODE_TOP            how many applications to list (default 12)
+#          LOCALCODE_MIN_SHOW_MIB   hide apps using less than this (default 20)
+#          NO_COLOR=1               plain output (also automatic when piped)
+# Default model: a "# localcode-default: NAME" comment in models.ini
+#                (else the first section after [*]).
+
+INI="${LOCALCODE_INI:-$HOME/models/models.ini}"
+LLAMA="$HOME/llama.cpp/build/bin/llama-server"
+URL="http://127.0.0.1:8081"
+LOG="$HOME/llama-server.log"
+# Listed but never offered for closing (prefix match on process name)
+PROTECTED='^(gnome-shell|gnome-session|Xorg|Xwayland|gdm|systemd|pipewire|wireplumber|mutter|xdg-desktop|llama-server)'
+MIN_FREE_MIB="${LOCALCODE_MIN_FREE_MIB:-12000}"
+TOP_N="${LOCALCODE_TOP:-12}"
+MIN_SHOW_MIB="${LOCALCODE_MIN_SHOW_MIB:-20}"
+
+# ---------- look & feel ----------
+UI_TTY=0; [[ -t 1 ]] && UI_TTY=1
+if (( UI_TTY )) && [[ -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+  C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_MUTE=$'\e[90m'
+  C_RED=$'\e[31m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_CYAN=$'\e[36m'
+else
+  C_RESET=''; C_BOLD=''; C_MUTE=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
+    G_OK='✓'; G_BAD='✗'; G_ARROW='›'; G_DOT='·'; G_TO='→'; G_PROMPT='❯'; ELL='…'
+    G_ON='█'; G_OFF='░'; G_RULE='─'; SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) ;;
+  *)
+    G_OK='+'; G_BAD='x'; G_ARROW='>'; G_DOT='-'; G_TO='->'; G_PROMPT='>'; ELL='...'
+    G_ON='#'; G_OFF='.'; G_RULE='-'; SPIN=('|' '/' '-' '\') ;;
+esac
+if (( UI_TTY )); then CUR_HIDE=$'\e[?25l'; CUR_SHOW=$'\e[?25h'; else CUR_HIDE=''; CUR_SHOW=''; fi
+# Terminal width: ask the real terminal first (a script's stdout is often not a tty,
+# so tput/COLUMNS alone can be wrong), then fall back. W leaves a 2-column margin
+# so the last column is never touched (that is what makes lines wrap).
+detect_cols() {
+  local c="${LOCALCODE_COLS:-}"
+  [[ $c =~ ^[0-9]+$ && $c -gt 0 ]] || c=$(stty size 2>/dev/null </dev/tty | awk '{print $2}')
+  [[ $c =~ ^[0-9]+$ && $c -gt 0 ]] || c=${COLUMNS:-}
+  [[ $c =~ ^[0-9]+$ && $c -gt 0 ]] || c=$(tput cols 2>/dev/null </dev/tty)
+  [[ $c =~ ^[0-9]+$ && $c -gt 0 ]] || c=100
+  echo "$c"
+}
+COLS=$(detect_cols)
+(( COLS > 160 )) && COLS=160
+(( COLS < 40 ))  && COLS=40
+W=$(( COLS - 2 ))
+
+BGPID=""
+trap 'printf "%s" "$CUR_SHOW"' EXIT
+trap '[[ -n $BGPID ]] && kill "$BGPID" 2>/dev/null; printf "%s\n" "$CUR_SHOW"; exit 130' INT TERM
+
+repeat() { local i s=""; for ((i = 0; i < $2; i++)); do s+=$1; done; printf '%s' "$s"; }
+pad()    { local n=$(( $2 - ${#1} )); (( n < 0 )) && n=0; printf '%s%*s' "$1" "$n" ''; }    # left-aligned
+padl()   { local n=$(( $2 - ${#1} )); (( n < 0 )) && n=0; printf '%*s%s' "$n" '' "$1"; }    # right-aligned
+trunc()  { if (( $2 > ${#ELL} && ${#1} > $2 )); then printf '%s%s' "${1:0:$2-${#ELL}}" "$ELL"; else printf '%s' "$1"; fi; }
+gib()    { printf '%d.%d' $(( $1 / 1024 )) $(( ($1 % 1024) * 10 / 1024 )); }
+
+# trunc_w STRING MAXWIDTH - cut a string so it fits in MAXWIDTH terminal columns
+# (adds the ellipsis when cut). CJK and emoji count as 2 columns, combining marks 0,
+# so text in other scripts cannot push a row past the edge.
+trunc_w() {
+  local s=$1 max=$2 out="" w=0 total=0 i ch cw code
+  for (( i = 0; i < ${#s}; i++ )); do
+    printf -v code '%d' "'${s:i:1}" 2>/dev/null || code=0
+    if (( code >= 4352 )); then cw=2; elif (( code >= 768 && code <= 879 )); then cw=0; else cw=1; fi
+    total=$(( total + cw ))
+  done
+  if (( total <= max )); then printf '%s' "$s"; return; fi
+  for (( i = 0; i < ${#s}; i++ )); do
+    ch=${s:i:1}; printf -v code '%d' "'$ch" 2>/dev/null || code=0
+    if (( code >= 4352 )); then cw=2; elif (( code >= 768 && code <= 879 )); then cw=0; else cw=1; fi
+    (( w + cw > max - ${#ELL} )) && break
+    out+=$ch; w=$(( w + cw ))
+  done
+  printf '%s%s' "$out" "$ELL"
+}
+
+# bar USED TOTAL WIDTH [COLOR]  (colour follows how full it is unless COLOR is given)
+bar() {
+  local used=$1 total=$2 w=$3 col=${4:-} on pct
+  (( total > 0 )) || total=1
+  on=$(( used * w / total )); (( used > 0 && on == 0 )) && on=1; (( on > w )) && on=$w
+  if [[ -z $col ]]; then
+    pct=$(( used * 100 / total )); col=$C_GREEN
+    (( pct >= 60 )) && col=$C_YELLOW
+    (( pct >= 85 )) && col=$C_RED
+  fi
+  printf '%s%s%s%s%s' "$col" "$(repeat "$G_ON" "$on")" "$C_MUTE" "$(repeat "$G_OFF" $(( w - on )))" "$C_RESET"
+}
+
+step() { printf '  %s%s%s  %s%-8s%s %s\n' "$1" "$2" "$C_RESET" "$C_BOLD" "$3" "$C_RESET" "$4"; }
+ok()   { step "$C_GREEN"  "$G_OK"    "$1" "$2"; }
+info() { step "$C_CYAN"   "$G_ARROW" "$1" "$2"; }
+warn() { step "$C_YELLOW" '!'        "$1" "$2"; }
+bad()  { step "$C_RED"    "$G_BAD"   "$1" "$2"; }
+say()  { printf '       %s%s%s\n' "$C_MUTE" "$*" "$C_RESET"; }          # continuation line under a step
+die()  { printf '  %s%s%s  %s\n' "$C_RED" "$G_BAD" "$C_RESET" "$*" >&2; exit 1; }
+ask()  { local a; read -r -p "$1" a </dev/tty; echo "${a,,}"; }
+
+spin_frame() {   # spin_frame TICK LABEL TEXT T0
+  (( UI_TTY )) || return 0
+  printf '\r\e[K  %s%s%s  %s%-8s%s %s %s(%ds)%s' "$C_CYAN" "${SPIN[$1 % ${#SPIN[@]}]}" "$C_RESET" \
+    "$C_BOLD" "$2" "$C_RESET" "$(trunc_w "$3" $(( W - 24 )))" "$C_MUTE" $(( SECONDS - $4 )) "$C_RESET"
+}
+spin_start() { (( UI_TTY )) && printf '%s' "$CUR_HIDE"; return 0; }
+spin_clear() { (( UI_TTY )) && printf '\r\e[K%s' "$CUR_SHOW"; return 0; }
+spin() {         # spin PID LABEL TEXT   - animate until PID exits (one plain line when not a terminal)
+  local pid=$1 label=$2 text=$3 i=0 t0=$SECONDS
+  BGPID=$pid
+  if (( ! UI_TTY )); then info "$label" "$text ..."; wait "$pid" 2>/dev/null; BGPID=""; return 0; fi
+  spin_start
+  while kill -0 "$pid" 2>/dev/null; do
+    spin_frame "$i" "$label" "$text" "$t0"; i=$(( i + 1 )); sleep 0.1
+  done
+  spin_clear; wait "$pid" 2>/dev/null; BGPID=""
+}
+
+banner() {
+  printf '\n  %s%slocalcode%s  %s%s%s  %s%s%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_MUTE" "$G_DOT" "$C_RESET" "$C_BOLD" "$MODEL" "$C_RESET"
+  printf '  %s%s%s\n' "$C_MUTE" "$(repeat "$G_RULE" $(( W - 2 )))" "$C_RESET"
+}
+
+# ---------- arguments ----------
+MODEL="${LOCALCODE_MODEL:-}"
+FORCE_PICK=0
+while [[ ${1:-} == --lc-* ]]; do
+  case $1 in
+    --lc-model) [[ -n ${2:-} ]] || die "--lc-model needs a model name"; MODEL="$2"; shift 2 ;;
+    --lc-pick)  FORCE_PICK=1; shift ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+for c in nvidia-smi curl python3 awk; do
+  command -v "$c" >/dev/null || die "missing command: $c"
+done
+[[ -f $INI ]]   || die "models.ini not found: $INI"
+[[ -x $LLAMA ]] || die "llama-server not found: $LLAMA"
+NVSMI=$(command -v nvidia-smi)
+nvidia-smi() { timeout 10 "$NVSMI" "$@"; }   # never hang on the driver
+
+# ---------- default model ----------
+default_model() {
+  local m
+  m=$(sed -nE 's/^[[:space:]]*[;#][[:space:]]*localcode-default[[:space:]]*[:=][[:space:]]*([^[:space:]]+).*/\1/p' "$INI" | head -1)
+  if [[ -n $m ]]; then echo "$m"; return; fi
+  awk '/^[ \t]*\[/ { s = $0; gsub(/^[ \t]*\[|\][ \t]*$/, "", s); if (s != "*") { print s; exit } }' "$INI"
+}
+[[ -n $MODEL ]] || MODEL=$(default_model)
+[[ -n $MODEL ]] || die "could not determine the default model from $INI"
+grep -qF "[$MODEL]" "$INI" || die "no [$MODEL] section in $INI"
+
+# ---------- GPU helpers ----------
+gpu_free()  { nvidia-smi --query-gpu=memory.free  --format=csv,noheader,nounits | head -1 | tr -d ' '; }
+gpu_total() { nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' '; }
+
+vram_line() {
+  local free total bw=$(( W - 48 ))
+  (( bw > 24 )) && bw=24
+  (( bw < 8 ))  && bw=8
+  free=$(gpu_free); total=$(gpu_total)
+  [[ $free =~ ^[0-9]+$ && $total =~ ^[0-9]+$ ]] || return 0
+  printf '  %sVRAM%s  %s  %s / %s GiB used  %s%s%s  %s GiB free\n' "$C_MUTE" "$C_RESET" \
+    "$(bar $(( total - free )) "$total" "$bw")" "$(gib $(( total - free )))" "$(gib "$total")" \
+    "$C_MUTE" "$G_DOT" "$C_RESET" "$(gib "$free")"
+}
+
+# pid|MiB|type, largest first.
+# Parses the nvidia-smi process table so graphics (G) and C+G processes are
+# included, not only compute ones (--query-compute-apps misses pure G processes
+# such as gnome-shell). Falls back to the compute query if the table has none.
+gpu_procs() {
+  local out
+  out=$(nvidia-smi 2>/dev/null | awk '
+    $1 == "|" && $5 ~ /^[0-9]+$/ && $(NF-1) ~ /MiB$/ {
+      m = $(NF-1); sub(/MiB/, "", m); print $5 "|" m "|" $6
+    }')
+  if [[ -z $out ]]; then
+    out=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null |
+      awk -F', *' 'NF >= 2 { print $1 "|" $2 "|C" }')
+  fi
+  [[ -n $out ]] && sort -t'|' -k2,2nr <<<"$out"
+}
+
+# This script's ancestors (terminal, shell...) are never offered for closing
+ANCESTORS=$( p=$$; while [[ -n $p && $p -gt 1 ]]; do echo -n "$p "; p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); done )
+is_ancestor() { [[ " $ANCESTORS " == *" $1 "* ]]; }
+
+# Fill the G_* arrays: one entry per application (same process name), largest
+# first. G_DISP is the full program name (comm is cut at 15 characters).
+# G_LOCK holds the reason an entry must be kept (empty = closable).
+build_groups() {
+  G_NAME=(); G_DISP=(); G_MEM=(); G_PIDS=(); G_TYPE=(); G_LOCK=()
+  local -A mem pids types lock disp
+  local pid m t comm owner reason k exe
+  while IFS='|' read -r pid m t; do
+    [[ -z $pid ]] && continue
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || continue
+    [[ -n $comm ]] || continue
+    owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+    reason=""
+    [[ $comm =~ $PROTECTED ]] && reason="system"
+    is_ancestor "$pid" && reason="your terminal"
+    [[ $owner == "$USER" ]] || reason="owner: ${owner:-?}"
+    if [[ -z ${disp[$comm]:-} ]]; then          # first PID of a group is its largest
+      exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null); exe=${exe% (deleted)}
+      disp[$comm]=${exe##*/}; [[ -n ${disp[$comm]} ]] || disp[$comm]=$comm
+    fi
+    mem[$comm]=$(( ${mem[$comm]:-0} + m ))
+    pids[$comm]+="$pid "
+    types[$comm]="$t"
+    [[ -n $reason ]] && lock[$comm]="$reason"
+  done < <(gpu_procs)
+  while IFS= read -r k; do
+    [[ -n $k ]] || continue
+    G_NAME+=("$k"); G_DISP+=("${disp[$k]}"); G_MEM+=("${mem[$k]}"); G_PIDS+=("${pids[$k]}")
+    G_TYPE+=("${types[$k]}"); G_LOCK+=("${lock[$k]:-}")
+  done < <(for k in "${!mem[@]}"; do echo "${mem[$k]} $k"; done | sort -rn | cut -d' ' -f2-)
+}
+
+# ---------- process details (read live from the system, nothing stored) ----------
+DESKTOP_DIRS=( /usr/share/applications "$HOME/.local/share/applications"
+  /var/lib/flatpak/exports/share/applications "$HOME/.local/share/flatpak/exports/share/applications"
+  /var/lib/snapd/desktop/applications )
+
+# "Name - short comment" from the .desktop entry whose Exec= starts with this program
+desktop_info() {
+  local re f="" pat name comment
+  re=$(sed 's/[][\.*^$+?(){}|/]/\\&/g' <<<"$1")
+  for pat in "^Exec=(env [^ ]+ )?([^ ]*/)?${re}( |\$)" "^Exec=(env [^ ]+ )?([^ ]*/)?${re}"; do
+    f=$(grep -rlsiE -m1 --include='*.desktop' -e "$pat" "${DESKTOP_DIRS[@]}" 2>/dev/null | head -1)
+    [[ -n $f ]] && break
+  done
+  [[ -n $f ]] || return 1
+  name=$(sed -nE 's/^Name=(.*)/\1/p' "$f" | head -1)
+  comment=$(sed -nE 's/^Comment=(.*)/\1/p' "$f" | head -1)
+  [[ -n $name ]] || return 1
+  case ${comment,,} in "${name,,}"*|"") comment="" ;; esac        # comment that only repeats the name
+  if (( ${#comment} > 34 )); then
+    comment=${comment:0:34}; comment=${comment% *}
+    while [[ $comment == *" "* && ${comment##* } =~ ^(a|an|the|of|and|or|for|to|in|on|with)$ ]]; do comment=${comment% *}; done
+    comment+=$ELL
+  fi
+  echo "$name${comment:+ - $comment}"
+}
+
+# systemd unit name -> a few friendly words
+unit_label() {
+  local u=$1 n
+  case $u in
+    snap.*)           n=${u#snap.}; echo "Snap app: ${n%%.*}" ;;
+    app-flatpak-*)    n=${u#app-flatpak-}; echo "Flatpak app: ${n%-[0-9]*.scope}" ;;
+    app-*)            n=${u#app-}; n=${n#*-}; echo "Desktop app: ${n%-[0-9]*.scope}" ;;
+    session-*.scope)  echo "Login session" ;;
+    *.service)        echo "Service: ${u%.service}" ;;
+    *)                echo "Unit: $u" ;;
+  esac
+}
+
+# A few words about one PID: desktop entry name, else the Debian package summary,
+# else the systemd unit it runs under; plus the Chromium/Electron role if any.
+proc_detail() {
+  local pid=$1 exe base args kind desc="" pkg unit
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null); exe=${exe% (deleted)}
+  base=${exe##*/}
+  [[ -n $base ]] || base=$(ps -o comm= -p "$pid" 2>/dev/null)
+  args=$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline")   # quiet if the process just exited
+  kind=$(grep -oE -m1 -- '--type=[a-z-]+' <<<"$args" | head -1); kind=${kind#--type=}
+  [[ -n $base ]] && desc=$(desktop_info "$base")
+  if [[ -z $desc && -n $exe ]] && command -v dpkg >/dev/null; then
+    pkg=$(dpkg -S "$exe" 2>/dev/null | head -1 | cut -d: -f1)
+    [[ -n $pkg ]] && desc=$(dpkg-query -W -f='${binary:Summary}' "$pkg" 2>/dev/null)
+  fi
+  if [[ -z $desc ]]; then
+    unit=$(grep -oE '[^/]+\.(service|scope)$' "/proc/$pid/cgroup" 2>/dev/null | head -1)
+    [[ -n $unit ]] && desc=$(unit_label "$unit")
+  fi
+  [[ -n $kind ]] && desc="${desc:+$desc }(${kind//-/ })"
+  desc=${desc//[[:cntrl:]]/ }                     # a stray newline or tab would break the row
+  echo "${desc:-no details found}"
+}
+
+# One table row. Uses NW, DW, MAXMEM, BAR_ON and KIND_ON from show_groups.
+print_row() {
+  local i=$1 lab=$2 locked=$3 kind procs det np numc memc barc namec tag=""
+  case ${G_TYPE[i]} in G) kind=gfx ;; C) kind=cmp ;; *) kind=both ;; esac
+  np=$(wc -w <<<"${G_PIDS[i]}"); procs=""; (( np > 1 )) && procs="x$np"
+  [[ -n $locked ]] && tag="[${G_LOCK[i]}] "
+  det=$(trunc_w "$tag$(proc_detail "${G_PIDS[i]%% *}")" "$DW")
+  if [[ -n $locked ]]; then
+    numc=$C_MUTE; memc=$C_MUTE; barc=$C_MUTE; namec=$C_MUTE
+  else
+    numc=$C_BOLD$C_CYAN; barc=$C_CYAN; namec=$C_BOLD; memc=""
+    (( G_MEM[i] >= 1024 )) && memc=$C_YELLOW
+    (( G_MEM[i] >= 4096 )) && memc=$C_RED
+  fi
+  local line
+  line=$(printf '  %s%s%s  %s%s%s' "$numc" "$(padl "$lab" 3)" "$C_RESET" "$memc" "$(padl "${G_MEM[i]} MiB" 9)" "$C_RESET")
+  (( BAR_ON )) && line+="  $(bar "${G_MEM[i]}" "$MAXMEM" 6 "$barc")"
+  line+="  ${namec}$(pad "$(trunc "${G_DISP[i]}" "$NW")" "$NW")${C_RESET}"
+  (( KIND_ON )) && line+="  ${C_MUTE}$(pad "$kind" 4)${C_RESET}"
+  line+="  ${C_MUTE}$(padl "$procs" 5)${C_RESET}  ${C_MUTE}${det}${C_RESET}"
+  printf '%s\n' "$line"
+}
+
+# Print the GPU table: closable apps get a number, protected ones a dot.
+# Fills CLOSABLE with the G_* indexes of the numbered entries.
+show_groups() {
+  local i shown=0 hid_n=0 hid_mem=0 n=0 locks=0 NW=11 DW MAXMEM=1 BAR_ON KIND_ON
+  local -a vis=()
+  CLOSABLE=()
+  if (( ${#G_NAME[@]} == 0 )); then say "no processes reported by nvidia-smi"; return; fi
+  for i in "${!G_NAME[@]}"; do
+    (( G_MEM[i] > MAXMEM )) && MAXMEM=${G_MEM[i]}
+    if (( shown < TOP_N && G_MEM[i] >= MIN_SHOW_MIB )); then
+      vis[i]=1; shown=$(( shown + 1 ))
+      (( ${#G_DISP[i]} > NW )) && NW=${#G_DISP[i]}
+    else
+      hid_n=$(( hid_n + 1 )); hid_mem=$(( hid_mem + G_MEM[i] ))
+    fi
+  done
+  (( NW > 22 )) && NW=22
+  # Layout from the real width W. A row is: 2 indent, # (3), VRAM (9), [bar 6], name NW,
+  # [kind 4], procs (5), details DW, with 2 spaces between columns. When the terminal is
+  # narrow, drop the Kind column first, then the bar, then shrink the name; Details
+  # always gets the rest and is cut to fit, so nothing can wrap.
+  BAR_ON=1; KIND_ON=1; DW=$(( W - 27 - NW - 14 ))
+  if (( DW < 24 )); then KIND_ON=0; DW=$(( W - 27 - NW - 8 )); fi
+  if (( DW < 24 )); then BAR_ON=0;  DW=$(( W - 27 - NW )); fi
+  if (( DW < 16 )); then NW=$(( NW - (16 - DW) )); (( NW < 8 )) && NW=8; DW=$(( W - 27 - NW )); fi
+  (( DW < 8 )) && DW=8
+
+  local hdr
+  hdr=$(printf '  %s  %s' "$(padl '#' 3)" "$(padl VRAM 9)")
+  (( BAR_ON ))  && hdr+="  $(pad '' 6)"
+  hdr+="  $(pad "$(trunc Application "$NW")" "$NW")"
+  (( KIND_ON )) && hdr+="  $(pad Kind 4)"
+  hdr+="  $(padl Procs 5)  Details"
+  printf '%s%s%s\n' "$C_MUTE" "$hdr" "$C_RESET"
+  for i in "${!G_NAME[@]}"; do
+    [[ -n ${vis[i]:-} && -z ${G_LOCK[i]} ]] || continue
+    n=$(( n + 1 )); CLOSABLE+=("$i"); print_row "$i" "$n)" ""
+  done
+  for i in "${!G_NAME[@]}"; do
+    [[ -n ${vis[i]:-} && -n ${G_LOCK[i]} ]] || continue
+    (( locks++ == 0 )) && printf '  %s%s kept: cannot be closed from here%s\n' "$C_MUTE" "$(repeat "$G_RULE" 3)" "$C_RESET"
+    print_row "$i" "$G_DOT" "1"
+  done
+  (( hid_n > 0 )) && printf '  %s+ %d more using %d MiB combined%s\n' "$C_MUTE" "$hid_n" "$hid_mem" "$C_RESET"
+  for i in "${!G_NAME[@]}"; do
+    if [[ ${G_NAME[i]} == ollama && -n ${G_LOCK[i]} ]]; then
+      printf '\n  %s!%s  ollama holds %s MiB and runs as another user. Free it with:\n' "$C_YELLOW" "$C_RESET" "${G_MEM[i]}"
+      say "ollama stop <model>      (see 'ollama ps')   or   sudo systemctl stop ollama"
+    fi
+  done
+  if (( ${#CLOSABLE[@]} > 0 )); then
+    printf '\n  %s%s%s\n' "$C_MUTE" "$(trunc_w 'Closing an app closes all its windows - save your work first.' $(( W - 2 )))" "$C_RESET"
+  fi
+  return 0
+}
+
+# TERM everything first, wait a few seconds, then KILL what is left
+close_pids() {
+  local pid i alive
+  for pid in "$@"; do kill -TERM "$pid" 2>/dev/null; done
+  for i in 1 2 3 4 5 6; do
+    alive=0
+    for pid in "$@"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    (( alive )) || return 0
+    sleep 1
+  done
+  say "still running - forcing"
+  for pid in "$@"; do kill -KILL "$pid" 2>/dev/null; done
+}
+
+# List GPU applications, let the user pick some, close them (after a yes).
+# $1 = what "q" does ("skip" or "quit"). return 0 = go on, 1 = q pressed / nothing to close
+pick_and_close() {
+  local what=${1:-quit} sel n idx total ans names before after
+  local -a chosen
+  local -A seen
+  while :; do
+    build_groups
+    echo; vram_line; echo
+    show_groups
+    if (( ${#CLOSABLE[@]} == 0 )); then
+      echo; warn gpu "nothing closable is using the GPU"
+      say "Try a smaller ctx-size in models.ini, or move the monitors to the integrated GPU."
+      return 1
+    fi
+    echo
+    read -r -p "  ${C_CYAN}${G_PROMPT}${C_RESET} ${C_BOLD}Close which?${C_RESET} ${C_MUTE}(e.g. 1 3, Enter = go on, q = ${what})${C_RESET} " sel </dev/tty
+    [[ ${sel,,} == q ]] && return 1
+    [[ -z $sel ]] && return 0
+
+    chosen=(); seen=(); total=0; names=""
+    for n in ${sel//,/ }; do
+      n=${n%)}
+      if [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#CLOSABLE[@]} )); then
+        [[ -n ${seen[$n]:-} ]] && continue
+        seen[$n]=1
+        idx=${CLOSABLE[n-1]}
+        chosen+=("$idx")
+        total=$(( total + G_MEM[idx] ))
+        names+="${names:+, }${G_DISP[idx]}"
+      else
+        say "ignoring '$n' (not a numbered entry)"
+      fi
+    done
+    (( ${#chosen[@]} )) || continue
+
+    ans=$(ask "  ${C_YELLOW}?${C_RESET} Close ${C_BOLD}${names}${C_RESET} (about ${total} MiB)? [y/N] ")
+    [[ $ans == y ]] || continue
+    before=$(gpu_free); [[ $before =~ ^[0-9]+$ ]] || before=0
+    for idx in "${chosen[@]}"; do
+      info closing "${G_DISP[idx]}"
+      close_pids ${G_PIDS[idx]}
+    done
+    sleep 2
+    after=$(gpu_free); [[ $after =~ ^[0-9]+$ ]] || after=0
+    ok gpu "closed  ${C_MUTE}VRAM free $(gib "$before") ${G_TO} $(gib "$after") GiB${C_RESET}"
+    return 0
+  done
+}
+
+# Run before loading: show the GPU users; ask only if free VRAM is low
+# (or --lc-pick was given).
+gpu_preflight() {
+  local free
+  free=$(gpu_free); [[ $free =~ ^[0-9]+$ ]] || free=0
+  if (( ! FORCE_PICK )) && (( free >= MIN_FREE_MIB )); then
+    ok gpu "$(gib "$free") GiB free  ${C_MUTE}${G_DOT} needs about $(gib "$MIN_FREE_MIB") GiB${C_RESET}"
+    echo; build_groups; show_groups; echo
+    return 0
+  fi
+  if (( FORCE_PICK )); then info gpu "picker requested"
+  else warn gpu "only $(gib "$free") GiB free, the model wants about $(gib "$MIN_FREE_MIB") GiB"; fi
+  pick_and_close skip || true
+  echo; vram_line; echo
+}
+
+# ---------- router helpers ----------
+router_up() { curl -sf --max-time 5 "$URL/v1/models" >/dev/null; }
+
+model_state() {
+  curl -sf --max-time 5 "$URL/v1/models" | python3 -c '
+import sys, json
+want = sys.argv[1]
+for m in json.load(sys.stdin).get("data", []):
+    if m.get("id") == want:
+        print(m.get("status", {}).get("value", "unknown"))
+        break
+' "$MODEL"
+}
+
+ensure_router() {
+  local pid tick t0
+  if router_up; then ok router "already running"; return; fi
+
+  if pgrep -x llama-server >/dev/null; then
+    warn router "llama-server is running but not answering (stuck):"
+    pgrep -a -x llama-server | sed 's/^/         /'
+    [[ $(ask "  ${C_YELLOW}?${C_RESET} Kill it and start fresh? [Y/n] ") == n ]] && die "aborted"
+    pkill -KILL -x llama-server; sleep 2
+  fi
+
+  [[ -s $LOG ]] && cp "$LOG" "$LOG.prev"   # keep the previous run's log
+  nohup "$LLAMA" \
+    --models-preset "$INI" --models-max 1 \
+    --host 127.0.0.1 --port 8081 \
+    > "$LOG" 2>&1 &
+  pid=$!; t0=$SECONDS
+  (( UI_TTY )) || info router "starting ..."
+  spin_start
+  for (( tick = 0; tick < 240; tick++ )); do       # up to 60 s
+    if (( tick % 4 == 0 )); then
+      if router_up; then spin_clear; ok router "ready  ${C_MUTE}${URL#http://}${C_RESET}"; return; fi
+      if ! kill -0 "$pid" 2>/dev/null; then spin_clear; tail -n 20 "$LOG" >&2; die "llama-server exited early"; fi
+    fi
+    spin_frame "$tick" router "starting llama.cpp router" "$t0"
+    sleep 0.25
+  done
+  spin_clear; die "router did not answer within 60s (see $LOG)"
+}
+
+# Ask the router for one token, which makes it load the model.
+# On failure, LAST_LOG holds only the log lines written during this attempt.
+try_load() {
+  local before out pid
+  before=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  out=$(mktemp)
+  curl -s -o /dev/null -w '%{http_code}' --max-time 300 \
+    "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
+    > "$out" 2>/dev/null &
+  pid=$!
+  spin "$pid" model "loading $MODEL"
+  LAST_CODE=$(<"$out"); rm -f "$out"
+  [[ $LAST_CODE == "200" ]] && return 0
+  sleep 1
+  LAST_LOG=$(tail -c +$((before + 1)) "$LOG" 2>/dev/null)
+  return 1
+}
+
+# Size (MiB) of the allocation that ran out of memory, if any
+short_mib() {
+  sed -nE 's/.*allocating ([0-9.]+) MiB on device [0-9]+: cudaMalloc failed.*/\1/p' <<<"$LAST_LOG" |
+    tail -1 | cut -d. -f1
+}
+
+# ---------- main ----------
+banner
+vram_line
+echo
+
+ensure_router
+
+if [[ $(model_state) == "loaded" ]]; then
+  ok model "$MODEL already loaded"
+else
+  gpu_preflight
+  t0=$SECONDS
+  until try_load; do
+    short=$(short_mib)
+    if [[ -z $short ]]; then
+      bad model "load failed (HTTP $LAST_CODE), and it does not look like a memory problem"
+      [[ $LAST_CODE == "000" ]] && say "The router did not respond - try again, or kill llama-server."
+      say "Last log lines:"
+      tail -n 20 <<<"$LAST_LOG" | sed 's/^/         /'
+      exit 1
+    fi
+    bad model "out of memory: an allocation of ${short} MiB failed"
+    say "Free at least that much more VRAM (it may take a couple of rounds)."
+    pick_and_close quit || { say "Stopped. Log: $LOG"; exit 1; }
+    info model "retrying ..."
+  done
+  ok model "$MODEL loaded  ${C_MUTE}in $(( SECONDS - t0 ))s${C_RESET}"
+fi
+
+ok opencode "launching"
+echo
+printf '%s' "$CUR_SHOW"
+export OPENCODE_ENABLE_EXA=1
+exec opencode "$@"
