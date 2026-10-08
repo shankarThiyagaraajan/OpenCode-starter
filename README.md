@@ -1,6 +1,14 @@
 <div align="center">
 
-# OpenCode - Quick Start
+<a href="https://opencode.ai">
+  <picture>
+    <source srcset="https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
+    <source srcset="https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
+    <img src="https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/console/app/src/asset/logo-ornate-light.svg" alt="OpenCode logo" width="320">
+  </picture>
+</a>
+
+# opencode - Quick Start
 
 **OpenCode + llama.cpp on your own NVIDIA GPU, set up in one command.**
 
@@ -131,3 +139,10 @@ Any other arguments are passed to `opencode`.
 | `~/models/models.ini` | model presets |
 | `~/.config/opencode/opencode.jsonc` | OpenCode config |
 | `~/llama-server.log` | server log |
+<<<<<<< HEAD
+=======
+
+---
+
+OpenCode and its logo belong to the [OpenCode](https://opencode.ai) project. This repo is an independent setup helper.
+>>>>>>> 4237914 (Added Opencode logo)
