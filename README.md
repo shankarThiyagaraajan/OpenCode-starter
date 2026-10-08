@@ -139,10 +139,6 @@ Any other arguments are passed to `opencode`.
 | `~/models/models.ini` | model presets |
 | `~/.config/opencode/opencode.jsonc` | OpenCode config |
 | `~/llama-server.log` | server log |
-<<<<<<< HEAD
-=======
 
----
 
 OpenCode and its logo belong to the [OpenCode](https://opencode.ai) project. This repo is an independent setup helper.
->>>>>>> 4237914 (Added Opencode logo)
